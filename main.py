@@ -3,17 +3,66 @@ import json
 import websockets
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto
+)
 
-# Конфигурация
-TELEGRAM_BOT_TOKEN = ""  # Замените на ваш токен бота Telegram
-TELEGRAM_CHAT_ID = ""  # Замените на ID группы Telegram
-MAX_TOKEN = ""  # Замените на ваш токен Max
+# ================== Конфигурация ==================
+TELEGRAM_BOT_TOKEN = ""  # <-- замени на токен бота Telegram
+TELEGRAM_CHAT_ID = ""    # <-- ID группы Telegram
+MAX_TOKEN = ""            # <-- токен MAX
+# ==================================================
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 
-async def send_to_telegram(text):
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+def build_keyboard(sender_name=None, chat_name=None):
+    if sender_name:
+        btn_text = f"👤 {sender_name}"
+        if chat_name:
+            btn_text += f" | 💬 {chat_name}"
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=btn_text, callback_data="noop")]
+            ]
+        )
+    return None
+
+
+async def send_to_telegram(text, sender_name=None, chat_name=None):
+    kb = build_keyboard(sender_name, chat_name)
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+
+
+async def send_attachments(attaches, sender_name=None, chat_name=None):
+    if not attaches:
+        return
+
+    photos = [a for a in attaches if a.get("_type") == "PHOTO" and a.get("baseUrl")]
+    kb = build_keyboard(sender_name, chat_name)
+
+    # альбом фото
+    if len(photos) > 1:
+        media = [InputMediaPhoto(media=p["baseUrl"]) for p in photos]
+        await bot.send_media_group(TELEGRAM_CHAT_ID, media=media)
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="📷 Альбом",
+            reply_markup=kb
+        )
+    elif len(photos) == 1:
+        await bot.send_photo(
+            TELEGRAM_CHAT_ID,
+            photo=photos[0]["baseUrl"],
+            caption="📷 Фото",
+            reply_markup=kb
+        )
 
 
 async def get_user_name(websocket, sender_id):
@@ -22,12 +71,9 @@ async def get_user_name(websocket, sender_id):
         "cmd": 0,
         "seq": 2,
         "opcode": 32,
-        "payload": {
-            "contactIds": [sender_id]
-        }
+        "payload": {"contactIds": [sender_id]}
     }
     await websocket.send(json.dumps(request))
-
     response = await websocket.recv()
     data = json.loads(response)
 
@@ -41,6 +87,7 @@ async def get_user_name(websocket, sender_id):
 async def connect_to_max(maxtoken):
     uri = "wss://ws-api.oneme.ru/websocket"
     async with websockets.connect(uri) as websocket:
+        # первое сообщение
         first_message = {
             "ver": 11,
             "cmd": 0,
@@ -51,21 +98,20 @@ async def connect_to_max(maxtoken):
                     "deviceType": "WEB",
                     "locale": "ru",
                     "deviceLocale": "en",
-                    "osVersion": "ResendLinux",
+                    "osVersion": "Linux",
                     "deviceName": "Firefox",
-                    "headerUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
+                    "headerUserAgent": "Mozilla/5.0",
                     "appVersion": "25.7.11",
                     "screen": "827x1323 1.9x",
                     "timezone": "Europe/Moscow"
                 },
-                "deviceId": "d4a88e2a-dc04-48ca-b918-6fd91ddf392d"
+                "deviceId": "device id"
             }
         }
         await websocket.send(json.dumps(first_message))
+        await websocket.recv()
 
-        response = await websocket.recv()
-        print(f"Получен ответ на первое сообщение: {response}")
-
+        # второе сообщение
         second_message = {
             "ver": 11,
             "cmd": 0,
@@ -92,27 +138,36 @@ async def connect_to_max(maxtoken):
 
                 if data["opcode"] == 19:
                     for chat in data["payload"].get("chats", []):
-                        if chat.get("type") == "CHAT":  # Только групповые чаты
+                        if chat.get("type") == "CHAT":
                             groups[str(chat["id"])] = chat.get("title", str(chat["id"]))
                     print("Группы обновлены:", groups)
 
-                elif data["opcode"] == 64:
+                elif data["opcode"] == 64:  # личные
                     sender = str(data["payload"]["message"]["sender"])
                     text = data["payload"]["message"].get("text", "")
-                    sender_name = await get_user_name(websocket, sender)  # Запрос имени
-                    await send_to_telegram(
-                        f"({sender})\nБыло получено новое личное сообщение от <b>{sender_name}</b>, его текст:\n\n<code>{text}</code>"
-                    )
+                    attaches = data["payload"]["message"].get("attaches", [])
+                    sender_name = await get_user_name(websocket, sender)
 
-                elif data["opcode"] == 128:
+                    await send_to_telegram(
+                        f"Новое личное сообщение:\n\n<code>{text}</code>",
+                        sender_name=sender_name
+                    )
+                    await send_attachments(attaches, sender_name=sender_name)
+
+                elif data["opcode"] == 128:  # групповые
                     chat_id = str(data["payload"]["chatId"])
                     sender = str(data["payload"]["message"]["sender"])
                     text = data["payload"]["message"].get("text", "")
-                    chat_name = groups.get(chat_id, chat_id)  # Название группы или ID
-                    sender_name = await get_user_name(websocket, sender)  # Запрос имени
+                    attaches = data["payload"]["message"].get("attaches", [])
+                    chat_name = groups.get(chat_id, chat_id)
+                    sender_name = await get_user_name(websocket, sender)
+
                     await send_to_telegram(
-                        f"({chat_id}, {sender})\nБыло получено новое сообщение из группы <b>{chat_name}</b> от <b>{sender_name}</b>, его текст:\n\n<code>{text}</code>"
+                        f"{text}",
+                        sender_name=sender_name,
+                        chat_name=chat_name
                     )
+                    await send_attachments(attaches, sender_name=sender_name, chat_name=chat_name)
 
             except Exception as e:
                 print(f"Ошибка при обработке сообщения: {e}")
