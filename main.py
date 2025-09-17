@@ -11,7 +11,7 @@ from aiogram.types import (
 # ================== Конфигурация ==================
 TELEGRAM_BOT_TOKEN = ""  # <-- замени на токен бота Telegram
 TELEGRAM_CHAT_ID = ""    # <-- ID группы Telegram
-MAX_TOKEN = ""            # <-- токен MAX
+MAX_TOKEN = ""            # <-- токен MAX (https://github.com/Master290/maxresender/blob/main/maxtoken.md)
 # ==================================================
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -184,3 +184,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
