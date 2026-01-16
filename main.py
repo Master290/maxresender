@@ -8,14 +8,26 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto
+    InputMediaPhoto, InputMediaVideo, BufferedInputFile
 )
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
+ENABLE_SUPERCHATS = os.getenv("ENABLE_SUPERCHATS", "True").lower() == "true"
+
+if TELEGRAM_THREAD_ID and TELEGRAM_THREAD_ID.strip() and ENABLE_SUPERCHATS:
+    try:
+        TELEGRAM_THREAD_ID = int(TELEGRAM_THREAD_ID.strip())
+    except ValueError:
+        print(f"Некорректный TELEGRAM_THREAD_ID: {TELEGRAM_THREAD_ID}. Используется None.")
+        TELEGRAM_THREAD_ID = None
+else:
+    TELEGRAM_THREAD_ID = None
 MAX_TOKEN = os.getenv("MAX_TOKEN")
 MAX_WS_URI = os.getenv("MAX_WS_URI", "wss://ws-api.oneme.ru/websocket")
 MAX_WS_ORIGIN = os.getenv("MAX_WS_ORIGIN", "https://web.max.ru")
@@ -31,9 +43,25 @@ if not MAX_TOKEN:
     raise RuntimeError("Укажите MAX_TOKEN в .env")
 
 if not MAX_ALLOWED_CHAT_IDS:
-    print("НУкажите MAX_ALLOWED_CHAT_IDS в .env (через запятую), чтобы пересылать сообщения только из нужных групп.")
+    print("Укажите MAX_ALLOWED_CHAT_IDS в .env (через запятую), чтобы пересылать сообщения только из нужных групп.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
+_seq = 100
+_dispatcher = {}  # {seq: asyncio.Future}
+_session = None
+_name_cache = {}  # {user_id: name}
+
+def next_seq():
+    global _seq
+    _seq += 1
+    return _seq
+
+async def get_session():
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession()
+    return _session
+
 
 
 def build_keyboard(sender_name=None, chat_name=None):
@@ -49,62 +77,300 @@ def build_keyboard(sender_name=None, chat_name=None):
     return None
 
 
-async def send_to_telegram(text, sender_name=None, chat_name=None):
-    normalized = (text or "").strip()
-    if not normalized:
-        return  # избегаем отправки пустого сообщения
+async def get_file_url(websocket, file_id, chat_id, message_id):
+    seq = next_seq()
+    s_seq = str(seq)
+    future = asyncio.get_running_loop().create_future()
+    _dispatcher[s_seq] = future
     
-    kb = build_keyboard(sender_name, chat_name)
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=normalized,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb
-    )
-
-
-async def send_attachments(attaches, sender_name=None, chat_name=None):
-    if not attaches:
-        return
-
-    photos = [a for a in attaches if a.get("_type") == "PHOTO" and a.get("baseUrl")]
-    kb = build_keyboard(sender_name, chat_name)
-
-    # альбом фото
-    if len(photos) > 1:
-        media = [InputMediaPhoto(media=p["baseUrl"]) for p in photos]
-        await bot.send_media_group(TELEGRAM_CHAT_ID, media=media)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="📷 Альбом",
-            reply_markup=kb
-        )
-    elif len(photos) == 1:
-        await bot.send_photo(
-            TELEGRAM_CHAT_ID,
-            photo=photos[0]["baseUrl"],
-            caption="📷 Фото",
-            reply_markup=kb
-        )
-
-
-async def get_user_name(websocket, sender_id):
     request = {
         "ver": 11,
         "cmd": 0,
-        "seq": 2,
-        "opcode": 32,
-        "payload": {"contactIds": [sender_id]}
+        "seq": seq,
+        "opcode": 88,
+        "payload": {
+            "fileId": file_id,
+            "chatId": int(chat_id),
+            "messageId": str(message_id)
+        }
     }
-    await websocket.send(json.dumps(request))
-    response = await websocket.recv()
-    data = json.loads(response)
+    try:
+        await websocket.send(json.dumps(request))
+        data = await asyncio.wait_for(future, timeout=5.0)
+        return data.get("payload", {}).get("url")
+    except Exception as e:
+        print(f"Ошибка при ожидании ссылки на файл: {e}")
+        return None
+    finally:
+        _dispatcher.pop(s_seq, None)
 
-    if data.get("opcode") == 32 and data.get("payload", {}).get("contacts"):
-        for contact in data["payload"]["contacts"]:
-            if str(contact.get("id")) == str(sender_id):
-                return contact.get("names", [{}])[0].get("name", sender_id)
+
+async def get_video_url(websocket, video_id, chat_id, message_id):
+    seq = next_seq()
+    s_seq = str(seq)
+    future = asyncio.get_running_loop().create_future()
+    _dispatcher[s_seq] = future
+    
+    request = {
+        "ver": 11,
+        "cmd": 0,
+        "seq": seq,
+        "opcode": 83,
+        "payload": {
+            "videoId": video_id,
+            "chatId": int(chat_id),
+            "messageId": str(message_id)
+        }
+    }
+    try:
+        await websocket.send(json.dumps(request))
+        data = await asyncio.wait_for(future, timeout=5.0)
+        payload = data.get("payload", {})
+        # пробуем разные качества хз мб подойдет
+        for quality in ["MP4_720", "MP4_480", "MP4_360", "MP4_1080"]:
+            if quality in payload:
+                return payload[quality]
+        # резервный поиск любой ссылки
+        for val in payload.values():
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        return None
+    except Exception as e:
+        print(f"Ошибка при ожидании ссылки на видео: {e}")
+        return None
+    finally:
+        _dispatcher.pop(s_seq, None)
+
+
+
+async def send_to_telegram(text, sender_name=None, chat_name=None):
+    clean_text = (text or "").strip()
+    display_text = clean_text if clean_text else "<i>(пустое сообщение)</i>"
+    
+    normalized = display_text.replace("<", "&lt;").replace(">", "&gt;")
+    kb = build_keyboard(sender_name, chat_name)
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=normalized,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            message_thread_id=TELEGRAM_THREAD_ID
+        )
+    except Exception as e:
+        print(f"Ошибка при отправке в Telegram: {e}")
+
+
+async def send_attachments(websocket, attaches, chat_id, message_id, sender_name=None, chat_name=None):
+    if not attaches:
+        return
+
+    kb = build_keyboard(sender_name, chat_name)
+    
+    album_candidates = [a for a in attaches if a.get("_type") in ["PHOTO", "VIDEO"]]
+    remaining_attaches = [a for a in attaches if a not in album_candidates]
+
+    if album_candidates:
+        if len(album_candidates) > 1:
+            media_list = []
+            for a in album_candidates[:10]:
+                atype = a.get("_type")
+                file_id = a.get("fileId") or a.get("videoId")
+                
+                target_url = a.get("baseUrl") or a.get("url")
+                if not target_url and atype == "VIDEO" and file_id:
+                    target_url = await get_video_url(websocket, file_id, chat_id, message_id)
+                elif not target_url and file_id:
+                    target_url = await get_file_url(websocket, file_id, chat_id, message_id)
+                
+                if target_url:
+                    try:
+                        session = await get_session()
+                        async with session.get(target_url) as resp:
+                            if resp.status == 200:
+                                content = await resp.read()
+                                if len(content) <= 50 * 1024 * 1024:
+                                    ext = ".jpg" if atype == "PHOTO" else ".mp4"
+                                    fname = a.get("name") or (f"media{ext}")
+                                    input_file = BufferedInputFile(content, filename=fname)
+                                    
+                                    if atype == "PHOTO":
+                                        media_list.append(InputMediaPhoto(media=input_file))
+                                    else:
+                                        media_list.append(InputMediaVideo(media=input_file))
+                    except Exception as e:
+                        print(f"Ошибка при скачивании медиа для альбома: {e}")
+
+            if media_list:
+                try:
+                    await bot.send_media_group(TELEGRAM_CHAT_ID, media=media_list, message_thread_id=TELEGRAM_THREAD_ID)
+                    await bot.send_message(
+                        TELEGRAM_CHAT_ID, 
+                        text="Фото/Видео", 
+                        reply_markup=kb, 
+                        message_thread_id=TELEGRAM_THREAD_ID
+                    )
+                except Exception as e:
+                    print(f"Ошибка при отправке альбома: {e}")
+        else:
+            remaining_attaches.insert(0, album_candidates[0])
+
+    for a in remaining_attaches:
+        print(f"DEBUG: Аттач пришел: {json.dumps(a)}")
+        
+        atype = a.get("_type")
+        file_id = a.get("fileId") or a.get("videoId") or a.get("audioId")
+
+        file_name = a.get("name")
+        if not file_name:
+            if atype == "VIDEO": file_name = "Видео"
+            elif atype == "PHOTO": file_name = "Фото"
+            elif atype == "AUDIO": file_name = "Аудио"
+            else: file_name = "Файл"
+            
+        base_url = a.get("baseUrl")
+        direct_url = a.get("url")
+        
+        if base_url:
+            target_url = base_url
+        elif direct_url:
+            target_url = direct_url
+        elif atype in ["VIDEO", "VIDEO_MSG"] and file_id:
+            target_url = await get_video_url(websocket, file_id, chat_id, message_id)
+        elif file_id:
+            target_url = await get_file_url(websocket, file_id, chat_id, message_id)
+        else:
+            print(f"DEBUG: Не найден URL или ID для вложения: {atype}")
+            continue
+
+        if target_url:
+            try:
+                session = await get_session()
+                async with session.get(target_url) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        file_size = len(content)
+                        
+                        if file_size > 50 * 1024 * 1024: # лимит тг - 50МБ
+                            await send_to_telegram(
+                                f"⚠️ Файл <b>{file_name}</b> слишком велик для пересылки (>{file_size//1024//1024}MB).",
+                                sender_name=sender_name,
+                                chat_name=chat_name
+                            )
+                            continue
+
+                        input_file = BufferedInputFile(content, filename=file_name)
+                        
+                        if atype == "PHOTO":
+                            if not file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                input_file.filename = "photo.jpg"
+                            await bot.send_photo(TELEGRAM_CHAT_ID, photo=input_file, caption="📷 Фото", reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                        elif atype == "VOICE":
+                            await bot.send_voice(TELEGRAM_CHAT_ID, voice=input_file, reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                        elif atype == "AUDIO":
+                            if a.get("wave"):
+                                await bot.send_voice(TELEGRAM_CHAT_ID, voice=input_file, reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                            else:
+                                await bot.send_audio(TELEGRAM_CHAT_ID, audio=input_file, caption=f"🎵 {file_name}", reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                        elif atype == "VIDEO_MSG" or (atype == "VIDEO" and a.get("videoType") == 1 and a.get("width") == a.get("height")):
+                            try:
+                                if not input_file.filename.lower().endswith('.mp4'):
+                                    input_file.filename = "video_note.mp4"
+                                await bot.send_video_note(TELEGRAM_CHAT_ID, video_note=input_file, reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                            except Exception as ve:
+                                print(f"Не удалось отправить как кружок, пробуем как видео: {ve}")
+                                input_file = BufferedInputFile(content, filename="video.mp4")
+                                await bot.send_video(TELEGRAM_CHAT_ID, video=input_file, caption="📹 Кружок", reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                        elif atype == "VIDEO":
+                            await bot.send_video(TELEGRAM_CHAT_ID, video=input_file, caption=f"📹 {file_name}", reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                        else:
+                            await bot.send_document(TELEGRAM_CHAT_ID, document=input_file, caption=f"📎 {file_name}", reply_markup=kb, message_thread_id=TELEGRAM_THREAD_ID)
+                    else:
+                        print(f"Не удалось скачать вложение {file_name}: статус {resp.status}")
+            except Exception as e:
+                print(f"Ошибка при обработке вложения {file_name} ({atype}): {e}")
+
+
+async def get_user_name(websocket, sender_id):
+    sender_id = str(sender_id)
+    if sender_id in _name_cache:
+        return _name_cache[sender_id]
+
+    seq = next_seq()
+    s_seq = str(seq)
+    future = asyncio.get_running_loop().create_future()
+    _dispatcher[s_seq] = future
+    
+    request = {
+        "ver": 11,
+        "cmd": 0,
+        "seq": seq,
+        "opcode": 32,
+        "payload": {"contactIds": [int(sender_id)]}
+    }
+    try:
+        await websocket.send(json.dumps(request))
+        data = await asyncio.wait_for(future, timeout=5.0)
+        if data.get("opcode") == 32 and data.get("payload", {}).get("contacts"):
+            for contact in data["payload"]["contacts"]:
+                if str(contact.get("id")) == sender_id:
+                    name = contact.get("names", [{}])[0].get("name", sender_id)
+                    _name_cache[sender_id] = name
+                    return name
+    except Exception as e:
+        print(f"Ошибка при запросе имени ({sender_id}): {e}")
+    finally:
+        _dispatcher.pop(s_seq, None)
     return sender_id
+
+
+async def handle_max_message(websocket, data, groups):
+    try:
+        opcode = data.get("opcode")
+        
+        if opcode == 64:  # личные
+            sender = str(data["payload"]["message"]["sender"])
+            text = data["payload"]["message"].get("text", "")
+            attaches = data["payload"]["message"].get("attaches", [])
+            sender_name = await get_user_name(websocket, sender)
+            if text or not attaches:
+                await send_to_telegram(
+                    text,
+                    sender_name=sender_name
+                )
+            await send_attachments(
+                websocket, attaches, 
+                chat_id=sender, message_id=data["payload"]["message"]["id"],
+                sender_name=sender_name
+            )
+
+        elif opcode == 128:  # групповые
+            chat_id = str(data["payload"]["chatId"])
+            message_id = data["payload"]["message"]["id"]
+            if MAX_ALLOWED_CHAT_IDS and chat_id not in MAX_ALLOWED_CHAT_IDS:
+                return
+
+            sender = str(data["payload"]["message"]["sender"])
+            text = data["payload"]["message"].get("text", "")
+            attaches = data["payload"]["message"].get("attaches", [])
+            chat_name = groups.get(chat_id, chat_id)
+            sender_name = await get_user_name(websocket, sender)
+
+            if text or not attaches:
+                await send_to_telegram(
+                    text,
+                    sender_name=sender_name,
+                    chat_name=chat_name
+                )
+            await send_attachments(
+                websocket, attaches, 
+                chat_id=chat_id, message_id=message_id,
+                sender_name=sender_name, chat_name=chat_name
+            )
+    except Exception as e:
+        print(f"Критическая ошибка при обработке сообщения: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def connect_to_max(maxtoken):
@@ -114,7 +380,7 @@ async def connect_to_max(maxtoken):
                 MAX_WS_URI,
                 origin=MAX_WS_ORIGIN,
                 additional_headers={"User-Agent": "Mozilla/5.0"}
-            ) as websocket:
+            ) as websocket: # тут подключение вебсокета вообще рофл ну и пусть будет как будто можно и получше сделать вообще хз честно говоря
                 # первое сообщение
                 first_message = {
                     "ver": 11,
@@ -163,42 +429,24 @@ async def connect_to_max(maxtoken):
                     try:
                         message = await websocket.recv()
                         data = json.loads(message)
+                        
+                        msg_seq = data.get("seq")
+                        if msg_seq is not None:
+                            s_seq = str(msg_seq)
+                            if s_seq in _dispatcher:
+                                _dispatcher[s_seq].set_result(data)
+                                continue
 
-                        if data["opcode"] == 19:
+                        # основная обработка по opcode
+                        opcode = data.get("opcode")
+                        if opcode == 19:
                             for chat in data["payload"].get("chats", []):
                                 if chat.get("type") == "CHAT":
                                     groups[str(chat["id"])] = chat.get("title", str(chat["id"]))
                             print("Группы обновлены:", groups)
-
-                        elif data["opcode"] == 64:  # личные \ криво обрабатывается, крч можно забить на это
-                            sender = str(data["payload"]["message"]["sender"])
-                            text = data["payload"]["message"].get("text", "")
-                            attaches = data["payload"]["message"].get("attaches", [])
-                            sender_name = await get_user_name(websocket, sender)
-
-                            await send_to_telegram(
-                                f"Личное сообщение:\n\n<code>{text}</code>",
-                                sender_name=sender_name
-                            )
-                            await send_attachments(attaches, sender_name=sender_name)
-
-                        elif data["opcode"] == 128:  # групповые
-                            chat_id = str(data["payload"]["chatId"])
-                            if MAX_ALLOWED_CHAT_IDS and chat_id not in MAX_ALLOWED_CHAT_IDS:
-                                continue
-
-                            sender = str(data["payload"]["message"]["sender"])
-                            text = data["payload"]["message"].get("text", "")
-                            attaches = data["payload"]["message"].get("attaches", [])
-                            chat_name = groups.get(chat_id, chat_id)
-                            sender_name = await get_user_name(websocket, sender)
-
-                            await send_to_telegram(
-                                f"{text}",
-                                sender_name=sender_name,
-                                chat_name=chat_name
-                            )
-                            await send_attachments(attaches, sender_name=sender_name, chat_name=chat_name)
+                        
+                        elif opcode in [64, 128]:
+                            asyncio.create_task(handle_max_message(websocket, data, groups))
 
                     except ConnectionClosed as e:
                         print(f"Соединение оборвано: {e}")
@@ -220,6 +468,8 @@ async def main():
         print(f"Ошибка: {e}")
     finally:
         await bot.session.close()
+        if _session and not _session.closed:
+            await _session.close()
 
 
 if __name__ == "__main__":
