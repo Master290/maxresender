@@ -16,6 +16,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 MAX_TOKEN = os.getenv("MAX_TOKEN")
 MAX_WS_URI = os.getenv("MAX_WS_URI", "wss://ws-api.oneme.ru/websocket")
 MAX_WS_ORIGIN = os.getenv("MAX_WS_ORIGIN", "https://web.max.ru")
@@ -59,7 +60,8 @@ async def send_to_telegram(text, sender_name=None, chat_name=None):
         chat_id=TELEGRAM_CHAT_ID,
         text=normalized,
         parse_mode=ParseMode.HTML,
-        reply_markup=kb
+        reply_markup=kb,
+        message_thread_id=TELEGRAM_THREAD_ID
     )
 
 
@@ -77,14 +79,16 @@ async def send_attachments(attaches, sender_name=None, chat_name=None):
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text="📷 Альбом",
-            reply_markup=kb
+            reply_markup=kb,
+            message_thread_id=TELEGRAM_THREAD_ID
         )
     elif len(photos) == 1:
         await bot.send_photo(
             TELEGRAM_CHAT_ID,
             photo=photos[0]["baseUrl"],
             caption="📷 Фото",
-            reply_markup=kb
+            reply_markup=kb,
+            message_thread_id=TELEGRAM_THREAD_ID
         )
 
 
