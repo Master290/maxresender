@@ -17,6 +17,17 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
+ENABLE_SUPERCHATS = os.getenv("ENABLE_SUPERCHATS", "True").lower() == "true"
+
+if TELEGRAM_THREAD_ID and TELEGRAM_THREAD_ID.strip() and ENABLE_SUPERCHATS:
+    try:
+        TELEGRAM_THREAD_ID = int(TELEGRAM_THREAD_ID.strip())
+    except ValueError:
+        print(f"Некорректный TELEGRAM_THREAD_ID: {TELEGRAM_THREAD_ID}. Используется None.")
+        TELEGRAM_THREAD_ID = None
+else:
+    # Если суперчаты выключены или ID не задан, шлем в общую кучу (None)
+    TELEGRAM_THREAD_ID = None
 MAX_TOKEN = os.getenv("MAX_TOKEN")
 MAX_WS_URI = os.getenv("MAX_WS_URI", "wss://ws-api.oneme.ru/websocket")
 MAX_WS_ORIGIN = os.getenv("MAX_WS_ORIGIN", "https://web.max.ru")
@@ -32,7 +43,7 @@ if not MAX_TOKEN:
     raise RuntimeError("Укажите MAX_TOKEN в .env")
 
 if not MAX_ALLOWED_CHAT_IDS:
-    print("НУкажите MAX_ALLOWED_CHAT_IDS в .env (через запятую), чтобы пересылать сообщения только из нужных групп.")
+    print("Укажите MAX_ALLOWED_CHAT_IDS в .env (через запятую), чтобы пересылать сообщения только из нужных групп.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
