@@ -143,16 +143,22 @@ async def get_video_url(websocket, video_id, chat_id, message_id):
 
 
 
-async def send_to_telegram(text, sender_name=None, chat_name=None):
+async def send_to_telegram(text, sender_name=None, chat_name=None, escape=True):
     clean_text = (text or "").strip()
-    display_text = clean_text if clean_text else "<i>(пустое сообщение)</i>"
     
-    normalized = display_text.replace("<", "&lt;").replace(">", "&gt;")
+    if not clean_text:
+        final_text = "<i>(пустое сообщение)</i>"
+    else:
+        if escape:
+            final_text = clean_text.replace("<", "&lt;").replace(">", "&gt;")
+        else:
+            final_text = clean_text
+
     kb = build_keyboard(sender_name, chat_name)
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=normalized,
+            text=final_text,
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
             message_thread_id=TELEGRAM_THREAD_ID
@@ -331,12 +337,33 @@ async def handle_max_message(websocket, data, groups):
         if opcode == 64:  # личные
             sender = str(data["payload"]["message"]["sender"])
             text = data["payload"]["message"].get("text", "")
+            if text:
+                text = text.replace("<", "&lt;").replace(">", "&gt;")
+            
             attaches = data["payload"]["message"].get("attaches", [])
+            if attaches is None: attaches = []
+
+            link = data["payload"]["message"].get("link")
+            if link and link.get("type") == "FORWARD" and link.get("message"):
+                fwd_msg = link["message"]
+                fwd_sender_id = str(fwd_msg.get("sender"))
+                fwd_sender_name = await get_user_name(websocket, fwd_sender_id)
+                fwd_text = fwd_msg.get("text", "")
+                
+                if fwd_text:
+                    fwd_text = fwd_text.replace("<", "&lt;").replace(">", "&gt;")
+                
+                text = (text or "") + f"\n\n↩️ <b>Переслано от {fwd_sender_name}:</b>\n{fwd_text}"
+                
+                if fwd_msg.get("attaches"):
+                    attaches.extend(fwd_msg["attaches"])
+            
             sender_name = await get_user_name(websocket, sender)
             if text or not attaches:
                 await send_to_telegram(
                     text,
-                    sender_name=sender_name
+                    sender_name=sender_name,
+                    escape=False
                 )
             await send_attachments(
                 websocket, attaches, 
@@ -352,7 +379,27 @@ async def handle_max_message(websocket, data, groups):
 
             sender = str(data["payload"]["message"]["sender"])
             text = data["payload"]["message"].get("text", "")
+            if text:
+                text = text.replace("<", "&lt;").replace(">", "&gt;")
+                
             attaches = data["payload"]["message"].get("attaches", [])
+            if attaches is None: attaches = []
+
+            link = data["payload"]["message"].get("link")
+            if link and link.get("type") == "FORWARD" and link.get("message"):
+                fwd_msg = link["message"]
+                fwd_sender_id = str(fwd_msg.get("sender"))
+                fwd_sender_name = await get_user_name(websocket, fwd_sender_id)
+                fwd_text = fwd_msg.get("text", "")
+                
+                if fwd_text:
+                    fwd_text = fwd_text.replace("<", "&lt;").replace(">", "&gt;")
+                
+                text = (text or "") + f"\n\n↩️ <b>Переслано от {fwd_sender_name}:</b>\n{fwd_text}"
+                
+                if fwd_msg.get("attaches"):
+                    attaches.extend(fwd_msg["attaches"])
+            
             chat_name = groups.get(chat_id, chat_id)
             sender_name = await get_user_name(websocket, sender)
 
@@ -360,7 +407,8 @@ async def handle_max_message(websocket, data, groups):
                 await send_to_telegram(
                     text,
                     sender_name=sender_name,
-                    chat_name=chat_name
+                    chat_name=chat_name,
+                    escape=False
                 )
             await send_attachments(
                 websocket, attaches, 
